@@ -1,0 +1,209 @@
+------------------------------------------------------------------------
+
+**Single-Cell RNA-seq Data – Complete Guide Part 1: From FASTQ to Count Matrix**
+
+*Author: Ghad Ahmed*
+
+------------------------------------------------------------------------
+
+### Bulk vs. scRNA-seq
+
+-   Bulk (TruSeq): high transcript coverage, no single-cell resolution
+-   scRNA-seq: single-cell resolution, lower transcript capture, higher cost
+-   Choice depends on trade-off between coverage, resolution & budget
+
+### Applications of scRNA-seq
+
+-   **Heterogeneity** → identifies distinct cell populations; maps cell types in health & disease (e.g. tumors, immune cells)
+-   **Lineage Tracing** → tracks cell transitions over time; uses pseudotime analysis for differentiation trajectories
+-   **Stochastic Gene Expression** → identical cells can behave differently due to random gene activity fluctuations
+
+### scRNA-seq Methods Comparison
+
+| Method       | Capture Efficiency | Cost/Cell | Best For                          |
+|--------------|--------------------|-----------|-----------------------------------|
+| inDrops      | 70–80%             | \$0.06    | Cost-effective, customizable      |
+| 10x Genomics | 50–70%             | \$0.20    | Speed, high throughput            |
+| Drop-Seq     | \~10%              | \$0.06    | Budget workflows                  |
+| Seq-Well     | \~80%              | \$0.15    | High efficiency, non-droplet      |
+| SMART-seq    | \~80%              | \$1.00    | Full-length transcripts, isoforms |
+
+### Spatial Transcriptomics
+
+-   scRNA-seq loses tissue location information
+-   Spatial transcriptomics adds spatial coordinates to gene expression data
+-   Reveals where genes are expressed within tissue → maps cell types, tissue organization & cell–cell interactions
+
+------------------------------------------------------------------------
+
+### Step 1: Install Supporting Software
+
+``` bash
+conda create -n sc python=3.10
+conda activate sc
+conda config --add channels defaults
+conda config --add channels bioconda
+conda config --add channels conda-forge
+conda config --set channel_priority strict
+conda install -y sra-tools fastqc multiqc wget samtools
+
+# Verify
+fastqc --version    # FastQC v0.12.1
+multiqc --version   # multiqc, version 1.19
+prefetch --version  # prefetch : 3.0.10
+```
+
+------------------------------------------------------------------------
+
+### Step 2: Download Reference Genome
+
+``` bash
+mkdir -p ~/references/cellranger
+cd ~/references/cellranger
+wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2024-A.tar.gz
+tar -xzvf refdata-gex-GRCh38-2024-A.tar.gz
+# genome.fa → Reference genome FASTA
+# genes.gtf → Gene annotations
+# star/      → Pre-built STAR aligner index
+```
+
+------------------------------------------------------------------------
+
+### Step 3: Create Project Directory Structure
+
+``` bash
+mkdir -p ~/PBMC_scRNA && cd ~/PBMC_scRNA
+mkdir -p raw_data fastqc_reports cellranger_output scripts logs star_index star_output counts
+tree -L 1 .
+```
+
+------------------------------------------------------------------------
+
+### Step 4: Download 10x PBMC Dataset
+
+``` bash
+cd ~/PBMC_scRNA/raw_data
+wget https://cf.10xgenomics.com/samples/cell-exp/7.0.1/SC3pv3_GEX_Human_PBMC/SC3pv3_GEX_Human_PBMC_fastqs.tar
+tar -xf SC3pv3_GEX_Human_PBMC_fastqs.tar
+cd Chromium_3p_GEX_Human_PBMC_fastqs && ls -lh
+# I1_001.fastq.gz → Index read (usually not needed)
+# I2_001.fastq.gz → Second index read
+# R1_001.fastq.gz → Barcodes + UMI (MOST IMPORTANT)
+# R2_001.fastq.gz → Biological reads (gene sequence)
+```
+
+> **Note:** If using SRA files, rename to 10x convention: `SRRxxxx_1.fastq.gz → SampleName_S1_L001_R1_001.fastq.gz` `SRRxxxx_2.fastq.gz → SampleName_S1_L001_R2_001.fastq.gz`
+
+------------------------------------------------------------------------
+
+### Step 5: Quality Control with FastQC
+
+``` bash
+cd ~/PBMC_scRNA
+fastqc raw_data/Chromium_3p_GEX_Human_PBMC_fastqs/*_R2_001.fastq.gz \
+    --outdir fastqc_reports --threads 8 --quiet
+
+multiqc fastqc_reports \
+    --outdir fastqc_reports \
+    --filename multiqc_report \
+    --title "SC3pv3_GEX_Human_PBMC_fastqs_Quality_Control"
+```
+
+------------------------------------------------------------------------
+
+### Step 6: Build chr22-Only Reference for STARsolo
+
+> **Why chr22 only?** 16GB RAM is insufficient for full genome alignment. chr22 subset validates the pipeline with minimal resources.
+
+``` bash
+mkdir -p ~/references/chr22 && cd ~/references/chr22
+
+awk '/^>chr22/{flag=1} /^>chr/{if($0!~"^>chr22") flag=0} flag' \
+    ~/references/cellranger/refdata-gex-GRCh38-2024-A/fasta/genome.fa > chr22.fa
+
+zgrep -w "chr22" \
+    ~/references/cellranger/refdata-gex-GRCh38-2024-A/genes/genes.gtf.gz \
+    > ~/references/chr22/chr22.gtf
+
+ls -lh
+# chr22.fa  ~50M
+# chr22.gtf ~34M
+
+gunzip -c ~/references/cellranger-10.0.0/lib/python/cellranger/barcodes/3M-february-2018_TRU.txt.gz \
+    > ~/references/chr22/3M-february-2018.txt
+```
+
+------------------------------------------------------------------------
+
+### Step 7: Subset FASTQs (10M Reads for Practice)
+
+> **Why subset?** Full dataset \~350M reads = 30+ hours on 16GB RAM. 10M reads ≈ 1 hour, sufficient for chr22 practice.
+
+``` bash
+cd ~/PBMC_scRNA
+
+zcat raw_data/Chromium_3p_GEX_Human_PBMC_fastqs/Chromium_3p_GEX_Human_PBMC_S1_L001_R2_001.fastq.gz \
+    | head -40000000 | gzip > raw_data/R2_subset.fastq.gz
+
+zcat raw_data/Chromium_3p_GEX_Human_PBMC_fastqs/Chromium_3p_GEX_Human_PBMC_S1_L001_R1_001.fastq.gz \
+    | head -40000000 | gzip > raw_data/R1_subset.fastq.gz
+```
+
+------------------------------------------------------------------------
+
+### Step 8: Build STARsolo chr22 Index
+
+> `--genomeSAindexNbases 11` is tuned for chr22 size. Full genome uses default 14.
+
+``` bash
+STAR \
+    --runMode genomeGenerate \
+    --genomeDir ~/PBMC_scRNA/star_index \
+    --genomeFastaFiles ~/references/chr22/chr22.fa \
+    --sjdbGTFfile ~/references/chr22/chr22.gtf \
+    --runThreadN 8 \
+    --genomeSAindexNbases 11
+```
+
+------------------------------------------------------------------------
+
+### Step 9: Run STARsolo Alignment and Counting
+
+> **Important:** R2 goes first, R1 goes second (opposite of intuition) R2 = cDNA biological read \| R1 = barcode + UMI
+
+``` bash
+STAR \
+    --runMode alignReads \
+    --genomeDir ~/PBMC_scRNA/star_index \
+    --readFilesIn \
+        ~/PBMC_scRNA/raw_data/R2_subset.fastq.gz \
+        ~/PBMC_scRNA/raw_data/R1_subset.fastq.gz \
+    --readFilesCommand zcat \
+    --soloType CB_UMI_Simple \
+    --soloCBwhitelist ~/references/chr22/3M-february-2018.txt \
+    --soloCBstart 1 --soloCBlen 16 \
+    --soloUMIstart 17 --soloUMIlen 12 \
+    --outSAMtype BAM SortedByCoordinate \
+    --outSAMattributes NH HI nM AS CR UR CB UB GX GN sS sQ sM \
+    --outFileNamePrefix ~/PBMC_scRNA/star_output/ \
+    --runThreadN 4 \
+    --limitBAMsortRAM 8000000000
+```
+
+**Expected output:**
+
+```         
+star_output/Solo.out/Gene/
+├── filtered/
+│   ├── barcodes.tsv   ← valid cell barcodes
+│   ├── features.tsv   ← gene names/IDs
+│   └── matrix.mtx     ← count matrix
+└── raw/
+    ├── barcodes.tsv
+    ├── features.tsv
+    └── matrix.mtx
+```
+
+> Use `filtered/` for Seurat — empty droplets already removed.
+
+------------------------------------------------------------------------
